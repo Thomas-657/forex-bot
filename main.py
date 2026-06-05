@@ -6,7 +6,7 @@ from xml.etree import ElementTree
 
 TELEGRAM_TOKEN = "8690688254:AAHYhv2u3kufZob" + "-" + "yMFICeq7feEUj9CEz2E"
 CHAT_ID = "916618328"
-API_KEY = "demo"
+TD_API_KEY = "a44c800934c444a38b1c9eef1033d294"
 
 PAIRES = ["EUR/USD", "BTC/USD", "XAU/USD"]
 RISK_PAR_TRADE = 1.0
@@ -45,28 +45,90 @@ def envoyer_telegram(message):
     except Exception as e:
         print(f"Erreur Telegram : {e}")
 
+# Annonces HAUSSIÈRES pour le Gold
+ANNONCES_GOLD_BULL = {
+    "CPI": "Inflation haute = Gold monte (valeur refuge)",
+    "Inflation": "Inflation haute = Gold monte (valeur refuge)",
+    "NFP": "NFP faible = Fed dovish = Gold monte",
+    "Non-Farm": "NFP faible = Fed dovish = Gold monte",
+    "Unemployment": "Chomage haut = Fed dovish = Gold monte",
+    "Geopolitical": "Tension geo = Gold monte (valeur refuge)",
+    "War": "Tension geo = Gold monte (valeur refuge)",
+    "Crisis": "Crise = Gold monte (valeur refuge)",
+}
+
+# Annonces BAISSIÈRES pour le Gold
+ANNONCES_GOLD_BEAR = {
+    "Fed Rate": "Hausse des taux = Dollar fort = Gold baisse",
+    "FOMC": "Fed hawkish = Dollar fort = Gold baisse",
+    "Rate Hike": "Hausse des taux = Dollar fort = Gold baisse",
+    "GDP": "PIB fort = Economie solide = Gold baisse",
+    "Strong Dollar": "Dollar fort = Gold baisse",
+    "ISM": "ISM fort = Economie solide = Gold baisse",
+}
+
 def get_annonces_eco():
     try:
         url = "https://www.forexfactory.com/calendar.php"
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=15)
         html = r.text
+        today = datetime.now().strftime("%b %d")
+
+        # Verifier si annonce HIGH IMPACT aujourd hui
         mots_critiques = ["NFP", "Non-Farm", "FOMC", "Fed Rate", "ECB Rate", "CPI", "GDP", "Interest Rate", "Inflation", "Employment"]
+        annonce_trouvee = False
+        nom_annonce = None
+
         for mot in mots_critiques:
-            if mot.lower() in html.lower():
-                today = datetime.now().strftime("%b %d")
-                if today in html:
-                    print(f"  Annonce detectee : {mot}")
-                    return True, mot
-        print("  Aucune annonce HIGH IMPACT")
-        return False, None
+            if mot.lower() in html.lower() and today in html:
+                annonce_trouvee = True
+                nom_annonce = mot
+                break
+
+        # Detecter impact sur le Gold
+        impact_gold = "NEUTRE"
+        explication_gold = ""
+
+        for mot, explication in ANNONCES_GOLD_BULL.items():
+            if mot.lower() in html.lower() and today in html:
+                impact_gold = "BULLISH"
+                explication_gold = explication
+                break
+
+        for mot, explication in ANNONCES_GOLD_BEAR.items():
+            if mot.lower() in html.lower() and today in html:
+                impact_gold = "BEARISH"
+                explication_gold = explication
+                break
+
+        # Envoyer alerte Gold si impact detecte
+        if impact_gold != "NEUTRE":
+            emoji = "GOLD HAUSSIER" if impact_gold == "BULLISH" else "GOLD BAISSIER"
+            direction = "BUY" if impact_gold == "BULLISH" else "SELL"
+            msg = (
+                "ALERTE GOLD\n"
+                "Annonce : " + str(nom_annonce or "Evenement macro") + "\n"
+                "Impact : " + emoji + "\n"
+                "Raison : " + explication_gold + "\n"
+                "Surveille un signal " + direction + " sur XAU/USD"
+            )
+            envoyer_telegram(msg)
+
+        if annonce_trouvee:
+            print(f"  Annonce detectee : {nom_annonce} | Impact Gold : {impact_gold}")
+        else:
+            print(f"  Aucune annonce HIGH IMPACT | Impact Gold : {impact_gold}")
+
+        return annonce_trouvee, nom_annonce, impact_gold
+
     except Exception as e:
         print(f"  Calendrier : {e}")
         h = datetime.now().hour
         m = datetime.now().minute
         if datetime.now().weekday() == 4 and h == 14 and 25 <= m <= 45:
-            return True, "NFP possible"
-        return False, None
+            return True, "NFP possible", "NEUTRE"
+        return False, None, "NEUTRE"
 
 def get_news_fxstreet(paire):
     try:
@@ -102,53 +164,47 @@ def get_news_fxstreet(paire):
         print(f"  FXStreet : {e}")
         return "NEUTRE", None
 
-def get_candles(paire, interval="15min", limit=100):
-    if "BTC" in paire:
-        url = f"https://www.alphavantage.co/query?function=DIGITAL_CURRENCY_INTRADAY&symbol=BTC&market=USD&apikey={API_KEY}"
-        try:
-            r = requests.get(url, timeout=15)
-            data = r.json()
-            series = data.get("Time Series Crypto (5min)", {})
-            if not series: return None
-            candles = []
-            for v in list(series.values())[:limit]:
-                candles.append({
-                    "open": float(v.get("1. open", 0)),
-                    "high": float(v.get("2. high", 0)),
-                    "low": float(v.get("3. low", 0)),
-                    "close": float(v.get("4. close", 0)),
-                    "volume": float(v.get("5. volume", 1)),
-                })
-            return candles
-        except Exception as e:
-            print(f"Erreur BTC : {e}")
-            return None
+def get_candles(paire, interval="15min", limit=50):
+    symboles = {
+        "EUR/USD": "EUR/USD",
+        "BTC/USD": "BTC/USD",
+        "XAU/USD": "XAU/USD"
+    }
+    symbole = symboles.get(paire, paire)
+    intervalles = {
+        "15min": "15min",
+        "60min": "1h"
+    }
+    intervalle = intervalles.get(interval, "15min")
 
-    if "XAU" in paire:
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=XAUUSD&interval={interval}&apikey={API_KEY}&outputsize=compact"
-        key = f"Time Series ({interval})"
-    else:
-        fc, tc = paire.replace("/", " ").split()
-        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={fc}&to_symbol={tc}&interval={interval}&apikey={API_KEY}&outputsize=compact"
-        key = f"Time Series FX ({interval})"
-
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={symbole}"
+        f"&interval={intervalle}"
+        f"&outputsize={limit}"
+        f"&apikey={TD_API_KEY}"
+    )
     try:
         r = requests.get(url, timeout=15)
         data = r.json()
-        series = data.get(key, {})
-        if not series: return None
+        if data.get("status") == "error":
+            print(f"  Twelve Data erreur : {data.get('message')}")
+            return None
+        values = data.get("values", [])
+        if not values:
+            return None
         candles = []
-        for v in list(series.values())[:limit]:
+        for v in values:
             candles.append({
-                "open": float(v["1. open"]),
-                "high": float(v["2. high"]),
-                "low": float(v["3. low"]),
-                "close": float(v["4. close"]),
-                "volume": float(v.get("5. volume", 1)),
+                "open":   float(v["open"]),
+                "high":   float(v["high"]),
+                "low":    float(v["low"]),
+                "close":  float(v["close"]),
+                "volume": float(v.get("volume", 1) or 1),
             })
         return candles
     except Exception as e:
-        print(f"Erreur {paire} : {e}")
+        print(f"Erreur Twelve Data {paire} : {e}")
         return None
 
 def calc_ema(prices, period):
@@ -179,10 +235,8 @@ def calc_rsi_divergence(closes, period=7):
     if rsi_recent is None or rsi_ancien is None: return None
     prix_recent = closes[0]
     prix_ancien = closes[period]
-    if prix_recent < prix_ancien and rsi_recent > rsi_ancien:
-        return "BULL_DIV"
-    if prix_recent > prix_ancien and rsi_recent < rsi_ancien:
-        return "BEAR_DIV"
+    if prix_recent < prix_ancien and rsi_recent > rsi_ancien: return "BULL_DIV"
+    if prix_recent > prix_ancien and rsi_recent < rsi_ancien: return "BEAR_DIV"
     return None
 
 def calc_macd(closes, fast=5, slow=13, signal=5):
@@ -230,8 +284,7 @@ def calc_atr(candles, period=14):
 def detecter_niveaux_psychologiques(prix):
     niveau_rond = round(prix / 50) * 50
     distance = abs(prix - niveau_rond)
-    if distance <= 2:
-        return True, niveau_rond
+    if distance <= 2: return True, niveau_rond
     return False, None
 
 def detecter_structure(candles):
@@ -250,11 +303,9 @@ def detecter_order_block(candles):
         body = abs(c["close"] - c["open"])
         body_apres = abs(apres["close"] - apres["open"])
         if c["close"] < c["open"] and apres["close"] > apres["open"] and body_apres > body * 1.5:
-            ob_bull = (c["low"], c["high"])
-            break
+            ob_bull = (c["low"], c["high"]); break
         if c["close"] > c["open"] and apres["close"] < apres["open"] and body_apres > body * 1.5:
-            ob_bear = (c["low"], c["high"])
-            break
+            ob_bear = (c["low"], c["high"]); break
     return ob_bull, ob_bear
 
 def detecter_fvg(candles):
@@ -262,10 +313,8 @@ def detecter_fvg(candles):
     fvg_bull = fvg_bear = None
     for i in range(1, len(candles) - 1):
         prev, nxt = candles[i + 1], candles[i - 1]
-        if nxt["low"] > prev["high"]:
-            fvg_bull = (prev["high"], nxt["low"])
-        if nxt["high"] < prev["low"]:
-            fvg_bear = (nxt["high"], prev["low"])
+        if nxt["low"] > prev["high"]: fvg_bull = (prev["high"], nxt["low"])
+        if nxt["high"] < prev["low"]: fvg_bear = (nxt["high"], prev["low"])
     return fvg_bull, fvg_bear
 
 def detecter_choch(candles):
@@ -289,10 +338,7 @@ def score_technique(candles, paire=""):
     macd_l, macd_s, macd_h = calc_macd(closes, 5, 13, 5)
     vwap = calc_vwap(candles)
     bb_up, bb_mid, bb_low = calc_bollinger(closes)
-    atr = calc_atr(candles)
-
     sb, ss, rb, rs = 0, 0, [], []
-
     if ema9 and ema21:
         if ema9 > ema21: sb += 1; rb.append("OK EMA9 > EMA21")
         else: ss += 1; rs.append("OK EMA9 < EMA21")
@@ -318,47 +364,39 @@ def score_technique(candles, paire=""):
     if bb_up and bb_low:
         if prix <= bb_low: sb += 1; rb.append("OK Prix bande basse Bollinger")
         if prix >= bb_up: ss += 1; rs.append("OK Prix bande haute Bollinger")
-
     if "XAU" in paire:
         niveau_rond, niveau = detecter_niveaux_psychologiques(prix)
         if niveau_rond:
             sb += 1; rb.append(f"OK Niveau psychologique Gold ({niveau})")
             ss += 1; rs.append(f"OK Niveau psychologique Gold ({niveau})")
         if session_gold_optimale():
-            sb += 1; rb.append("OK Session Gold optimale (Londres/NY)")
-            ss += 1; rs.append("OK Session Gold optimale (Londres/NY)")
-
+            sb += 1; rb.append("OK Session Gold optimale")
+            ss += 1; rs.append("OK Session Gold optimale")
     return sb, ss, rb, rs
 
 def score_smc(candles, paire=""):
     if not candles or len(candles) < 10: return 0, 0, [], []
     sb, ss, rb, rs = 0, 0, [], []
     prix = candles[0]["close"]
-
     structure = detecter_structure(candles)
     if structure == "BULLISH": sb += 2; rb.append("OK Structure haussiere (BOS)")
     if structure == "BEARISH": ss += 2; rs.append("OK Structure baissiere (BOS)")
-
     ob_bull, ob_bear = detecter_order_block(candles)
     if ob_bull and ob_bull[0] <= prix <= ob_bull[1]:
         sb += 2; rb.append(f"OK Order Block haussier ({round(ob_bull[0],2)}-{round(ob_bull[1],2)})")
     if ob_bear and ob_bear[0] <= prix <= ob_bear[1]:
         ss += 2; rs.append(f"OK Order Block baissier ({round(ob_bear[0],2)}-{round(ob_bear[1],2)})")
-
     fvg_bull, fvg_bear = detecter_fvg(candles)
     if fvg_bull and fvg_bull[0] <= prix <= fvg_bull[1]:
         sb += 2; rb.append(f"OK FVG haussier ({round(fvg_bull[0],2)}-{round(fvg_bull[1],2)})")
     if fvg_bear and fvg_bear[0] <= prix <= fvg_bear[1]:
         ss += 2; rs.append(f"OK FVG baissier ({round(fvg_bear[0],2)}-{round(fvg_bear[1],2)})")
-
     choch = detecter_choch(candles)
-    if choch == "BULL_CHOCH": sb += 2; rb.append("OK ChoCh haussier (liquidite chassee)")
-    if choch == "BEAR_CHOCH": ss += 2; rs.append("OK ChoCh baissier (liquidite chassee)")
-
+    if choch == "BULL_CHOCH": sb += 2; rb.append("OK ChoCh haussier")
+    if choch == "BEAR_CHOCH": ss += 2; rs.append("OK ChoCh baissier")
     cvd = sum(c["volume"] if c["close"] > c["open"] else -c["volume"] for c in candles[:10])
     if cvd > 0: sb += 1; rb.append("OK CVD positif")
     else: ss += 1; rs.append("OK CVD negatif")
-
     prix_volumes = {}
     for c in candles[:20]:
         pr = round((c["high"] + c["low"]) / 2, 1)
@@ -366,7 +404,6 @@ def score_smc(candles, paire=""):
     poc = max(prix_volumes, key=prix_volumes.get)
     if prix > poc: sb += 1; rb.append(f"OK Prix > POC ({poc})")
     else: ss += 1; rs.append(f"OK Prix < POC ({poc})")
-
     return sb, ss, rb, rs
 
 def contexte_htf(paire):
@@ -382,7 +419,7 @@ def contexte_htf(paire):
         if prix < ema21 < ema50 and structure == "BEARISH": return "BEARISH"
     return "NEUTRE"
 
-def analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonce):
+def analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonce, impact_gold="NEUTRE"):
     global trades_du_jour, pertes_consecutives
     if trades_du_jour >= MAX_TRADES_JOUR: return None
     if pertes_consecutives >= 2: return None
@@ -390,36 +427,31 @@ def analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonc
     if annonce_eco:
         envoyer_telegram(f"ANNONCE ECO : {nom_annonce}\nAucun signal par precaution.")
         return None
-
     prix = candles[0]["close"]
     atr = calc_atr(candles)
     session = nom_session()
     tendance_htf = contexte_htf(paire)
     time.sleep(12)
-
     sc_tech_b, sc_tech_s, rb_tech, rs_tech = score_technique(candles, paire)
     sc_smc_b, sc_smc_s, rb_smc, rs_smc = score_smc(candles, paire)
-
     bonus_b = 1 if news_sentiment == "BULLISH" else 0
     bonus_s = 1 if news_sentiment == "BEARISH" else 0
+    if "XAU" in paire:
+        if impact_gold == "BULLISH": bonus_b += 2; print("  +2 Gold annonce haussiere")
+        if impact_gold == "BEARISH": bonus_s += 2; print("  +2 Gold annonce baissiere")
     total_b = sc_tech_b + sc_smc_b + bonus_b
     total_s = sc_tech_s + sc_smc_s + bonus_s
-
     min_score = 5 if "XAU" in paire else 4
-
     signal = None
     if tendance_htf != "BEARISH" and sc_tech_b >= min_score and sc_smc_b >= 3 and total_b > total_s:
         signal = "BUY"
     elif tendance_htf != "BULLISH" and sc_tech_s >= min_score and sc_smc_s >= 3 and total_s > total_b:
         signal = "SELL"
-
     if not signal: return None
-
     is_gold = "XAU" in paire
     is_btc = "BTC" in paire
     pip = 1.0 if is_btc else (0.01 if is_gold else 0.0001)
     sl_dist = atr * ATR_MULTIPLIER_SL if atr else pip * (500 if is_btc else 200 if is_gold else 20)
-
     if signal == "BUY":
         sl = round(prix - sl_dist, 2)
         tp1 = round(prix + sl_dist * 1.5, 2)
@@ -430,25 +462,15 @@ def analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonc
         tp1 = round(prix - sl_dist * 1.5, 2)
         tp2 = round(prix - sl_dist * 2.5, 2)
         tp3 = round(prix - sl_dist * 4.0, 2)
-
     score_total = total_b if signal == "BUY" else total_s
-    score_max = 20
     qualite = "FORT" if score_total >= 12 else ("MOYEN" if score_total >= 8 else "STANDARD")
     tendance_txt = {"BULLISH": "Haussiere", "BEARISH": "Baissiere", "NEUTRE": "Neutre"}[tendance_htf]
-
     rb = (rb_tech + rb_smc) if signal == "BUY" else (rs_tech + rs_smc)
-
-    gold_note = ""
-    if is_gold:
-        gold_note = "\nGold : verifier Exocharts pour confirmer l orderflow"
-
-    news_section = ""
-    if news_titre:
-        news_section = f"\nNEWS : {news_titre[:80]}"
-
+    gold_note = "\nGold : verifier Exocharts pour confirmer l orderflow" if is_gold else ""
+    news_section = f"\nNEWS : {news_titre[:80]}" if news_titre else ""
     message = (
         f"{'ACHAT' if signal == 'BUY' else 'VENTE'} - {paire}\n"
-        f"Qualite : {qualite} ({score_total}/{score_max})\n"
+        f"Qualite : {qualite} ({score_total}/20)\n"
         f"Session : {session}\n"
         f"Tendance HTF : {tendance_txt}\n"
         f"News : {news_sentiment}\n\n"
@@ -458,8 +480,7 @@ def analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonc
         f"TP2 (35%) : {tp2}\n"
         f"TP3 (25%) : {tp3}\n\n"
         f"Confirmations :\n" + "\n".join(rb[:10]) +
-        news_section +
-        gold_note +
+        news_section + gold_note +
         f"\n\n{datetime.now().strftime('%d/%m/%Y %H:%M')}"
     )
     trades_du_jour += 1
@@ -474,42 +495,39 @@ def reset_si_nouveau_jour():
         envoyer_telegram("Nouveau jour - compteurs remis a zero.")
 
 def main():
-    print("Bot Pro Gold/Forex/BTC demarre !")
+    print("Bot Pro demarre avec Twelve Data !")
     print(f"Paires : {', '.join(PAIRES)}")
     envoyer_telegram(
         "Bot Pro demarre - 24h/24 !\n"
-        f"Paires : {', '.join(PAIRES)}\n\n"
+        f"Paires : {', '.join(PAIRES)}\n"
+        "Source donnees : Twelve Data (temps reel)\n\n"
         "Analyse Gold optimisee :\n"
         "- Structure BOS + ChoCh\n"
         "- Order Blocks + FVG\n"
         "- Divergence RSI\n"
         "- Niveaux psychologiques\n"
-        "- VWAP ancre\n"
-        "- ATR pour SL/TP\n\n"
+        "- VWAP + ATR\n\n"
         "Sources : FXStreet + ForexFactory\n"
         f"Risque : {RISK_PAR_TRADE}% / trade | Max {MAX_TRADES_JOUR}/jour\n"
         "Sortie : 40% TP1 / 35% TP2 / 25% TP3"
     )
-
     while True:
         reset_si_nouveau_jour()
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Lecture FXStreet & ForexFactory...")
-        annonce_eco, nom_annonce = get_annonces_eco()
+        annonce_eco, nom_annonce, impact_gold = get_annonces_eco()
         time.sleep(5)
-
         for paire in PAIRES:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Analyse {paire}...")
             news_sentiment, news_titre = get_news_fxstreet(paire)
             print(f"  News : {news_sentiment}")
             time.sleep(5)
-            candles = get_candles(paire, "15min", 100)
-            signal = analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonce)
+            candles = get_candles(paire, "15min", 50)
+            signal = analyser(paire, candles, news_sentiment, news_titre, annonce_eco, nom_annonce, impact_gold)
             if signal:
                 envoyer_telegram(signal)
             else:
                 print(f"  Pas de signal sur {paire}")
             time.sleep(15)
-
         print(f"\nProchaine analyse dans 15 min...")
         time.sleep(900)
 
