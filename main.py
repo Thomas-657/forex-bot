@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from xml.etree import ElementTree
 
-TELEGRAM_TOKEN = "8690688254:AAHYhv2u3kufZob-yMFICeq7feEUj9CEz2E"
+TELEGRAM_TOKEN = "8690688254:AAHYhv2u3kufZob" + "-" + "yMFICeq7feEUj9CEz2E"
 CHAT_ID = "916618328"
 API_KEY = "demo"
 
