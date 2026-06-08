@@ -332,6 +332,128 @@ def fvg(candles):
 # LIQUIDITÉS ICT
 # ══════════════════════════════
 
+# ══════════════════════════════
+# PATTERNS CHARTISTES
+# ══════════════════════════════
+
+def detecter_patterns(candles):
+    """
+    Détecte les patterns de bougies clés.
+    Pas obligatoires pour trader mais évitent de se faire piéger.
+    """
+    if len(candles) < 5:
+        return {}
+
+    resultats = {}
+    c    = candles[0]   # bougie actuelle
+    prev = candles[1]   # bougie précédente
+    prev2 = candles[2]  # avant-avant
+
+    body      = abs(c["close"] - c["open"])
+    full_range = c["high"] - c["low"]
+    mèche_haute = c["high"] - max(c["close"], c["open"])
+    mèche_basse = min(c["close"], c["open"]) - c["low"]
+
+    # ── PIN BAR ──
+    # Mèche longue = rejet fort d un niveau
+    # Haussier : mèche basse longue (rejet à la baisse)
+    if mèche_basse > body * 2 and mèche_basse > mèche_haute * 2:
+        resultats["pin_bar_bull"] = True
+        resultats["pin_bar_bull_txt"] = "Pin Bar haussier - rejet baissier fort"
+
+    # Baissier : mèche haute longue (rejet à la hausse)
+    if mèche_haute > body * 2 and mèche_haute > mèche_basse * 2:
+        resultats["pin_bar_bear"] = True
+        resultats["pin_bar_bear_txt"] = "Pin Bar baissier - rejet haussier fort"
+
+    # ── ENGULFING ──
+    # Bougie qui avale complètement la précédente = momentum fort
+    prev_body = abs(prev["close"] - prev["open"])
+
+    # Engulfing haussier : bougie verte avale bougie rouge
+    if (c["close"] > c["open"] and
+        prev["close"] < prev["open"] and
+        c["open"] < prev["close"] and
+        c["close"] > prev["open"]):
+        resultats["engulfing_bull"] = True
+        resultats["engulfing_bull_txt"] = "Engulfing haussier - momentum acheteur fort"
+
+    # Engulfing baissier : bougie rouge avale bougie verte
+    if (c["close"] < c["open"] and
+        prev["close"] > prev["open"] and
+        c["open"] > prev["close"] and
+        c["close"] < prev["open"]):
+        resultats["engulfing_bear"] = True
+        resultats["engulfing_bear_txt"] = "Engulfing baissier - momentum vendeur fort"
+
+    # ── INSIDE BAR ──
+    # Compression = marché indécis, breakout imminent
+    if c["high"] < prev["high"] and c["low"] > prev["low"]:
+        resultats["inside_bar"] = True
+        resultats["inside_bar_txt"] = "Inside Bar - compression - breakout imminent"
+
+    # ── HAMMER / SHOOTING STAR ──
+    # Hammer haussier : petite bougie avec grande mèche basse
+    if (body < full_range * 0.3 and
+        mèche_basse > full_range * 0.6 and
+        c["close"] >= c["open"]):
+        resultats["hammer"] = True
+        resultats["hammer_txt"] = "Hammer haussier - retournement probable"
+
+    # Shooting Star baissier : petite bougie avec grande mèche haute
+    if (body < full_range * 0.3 and
+        mèche_haute > full_range * 0.6 and
+        c["close"] <= c["open"]):
+        resultats["shooting_star"] = True
+        resultats["shooting_star_txt"] = "Shooting Star baissier - retournement probable"
+
+    # ── DOJI ──
+    # Indécision totale = attention, le marché cherche une direction
+    if body < full_range * 0.1 and full_range > 0:
+        resultats["doji"] = True
+        resultats["doji_txt"] = "Doji - indecision - attendre confirmation"
+
+    # ── DOUBLE TOP ──
+    # Deux highs au même niveau = résistance forte
+    if len(candles) >= 10:
+        highs = [c["high"] for c in candles[:10]]
+        marge = candles[0]["close"] * 0.001
+        for i in range(1, len(highs)):
+            if abs(highs[0] - highs[i]) < marge and highs[0] == max(highs):
+                resultats["double_top"] = True
+                resultats["double_top_txt"] = f"Double Top ({round(highs[0],2)}) - resistance forte"
+                break
+
+    # ── DOUBLE BOTTOM ──
+    # Deux lows au même niveau = support fort
+    if len(candles) >= 10:
+        lows = [c["low"] for c in candles[:10]]
+        marge = candles[0]["close"] * 0.001
+        for i in range(1, len(lows)):
+            if abs(lows[0] - lows[i]) < marge and lows[0] == min(lows):
+                resultats["double_bottom"] = True
+                resultats["double_bottom_txt"] = f"Double Bottom ({round(lows[0],2)}) - support fort"
+                break
+
+    # ── THREE WHITE SOLDIERS / THREE BLACK CROWS ──
+    # 3 bougies consécutives dans le même sens = momentum fort
+    if len(candles) >= 3:
+        if (candles[0]["close"] > candles[0]["open"] and
+            candles[1]["close"] > candles[1]["open"] and
+            candles[2]["close"] > candles[2]["open"] and
+            candles[0]["close"] > candles[1]["close"] > candles[2]["close"]):
+            resultats["three_soldiers"] = True
+            resultats["three_soldiers_txt"] = "3 soldats blancs - momentum haussier fort"
+
+        if (candles[0]["close"] < candles[0]["open"] and
+            candles[1]["close"] < candles[1]["open"] and
+            candles[2]["close"] < candles[2]["open"] and
+            candles[0]["close"] < candles[1]["close"] < candles[2]["close"]):
+            resultats["three_crows"] = True
+            resultats["three_crows_txt"] = "3 corbeaux noirs - momentum baissier fort"
+
+    return resultats
+
 def detecter_equal_highs_lows(candles):
     """
     Equal Highs (EQH) = niveaux où le prix a buté plusieurs fois
@@ -712,6 +834,43 @@ def analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal='NE
     if void_bull and void_bull[0] <= prix <= void_bull[1]:
         score_s += 1
         conf_s.append(f"Void baissier a combler ({round(void_bull[0],2)}-{round(void_bull[1],2)})")
+
+    # 8c. PATTERNS CHARTISTES — confirmation supplémentaire
+    patterns = detecter_patterns(candles)
+
+    # Patterns haussiers — bonus si alignés avec le signal
+    if patterns.get("pin_bar_bull"):
+        score_b += 2; conf_b.append(patterns["pin_bar_bull_txt"])
+    if patterns.get("engulfing_bull"):
+        score_b += 2; conf_b.append(patterns["engulfing_bull_txt"])
+    if patterns.get("hammer"):
+        score_b += 2; conf_b.append(patterns["hammer_txt"])
+    if patterns.get("double_bottom"):
+        score_b += 2; conf_b.append(patterns["double_bottom_txt"])
+    if patterns.get("three_soldiers"):
+        score_b += 1; conf_b.append(patterns["three_soldiers_txt"])
+
+    # Patterns baissiers
+    if patterns.get("pin_bar_bear"):
+        score_s += 2; conf_s.append(patterns["pin_bar_bear_txt"])
+    if patterns.get("engulfing_bear"):
+        score_s += 2; conf_s.append(patterns["engulfing_bear_txt"])
+    if patterns.get("shooting_star"):
+        score_s += 2; conf_s.append(patterns["shooting_star_txt"])
+    if patterns.get("double_top"):
+        score_s += 2; conf_s.append(patterns["double_top_txt"])
+    if patterns.get("three_crows"):
+        score_s += 1; conf_s.append(patterns["three_crows_txt"])
+
+    # Doji = indécision = on réduit le score des deux côtés
+    if patterns.get("doji"):
+        score_b = max(0, score_b - 1)
+        score_s = max(0, score_s - 1)
+        print(f"  Doji detecte sur {paire} - indecision")
+
+    # Inside Bar = on attend le breakout
+    if patterns.get("inside_bar"):
+        print(f"  Inside Bar sur {paire} - attendre breakout")
 
     # 9. SENTIMENT NEWS
     if sentiment == "BULLISH": score_b += 1; conf_b.append("Sentiment news haussier")
