@@ -1,5 +1,6 @@
 import requests
 import time
+import json
 from datetime import datetime
 from xml.etree import ElementTree
 
@@ -126,6 +127,90 @@ def get_sentiment(paire):
         return "NEUTRE"
     except:
         return "NEUTRE"
+
+# ══════════════════════════════
+# DXY (Dollar Index) — corrélation inverse Gold
+# ══════════════════════════════
+def get_dxy():
+    """
+    Le DXY monte = Dollar fort = Gold baisse
+    Le DXY baisse = Dollar faible = Gold monte
+    On utilise Twelve Data pour récupérer le DXY
+    """
+    try:
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol=DXY"
+            f"&interval=1h"
+            f"&outputsize=10"
+            f"&apikey={TD_API_KEY}"
+        )
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("status") == "error":
+            print(f"  DXY : {data.get('message')}")
+            return "NEUTRE", 0
+        values = data.get("values", [])
+        if not values or len(values) < 3:
+            return "NEUTRE", 0
+        prix_actuel = float(values[0]["close"])
+        prix_hier   = float(values[4]["close"]) if len(values) > 4 else prix_actuel
+        variation   = round(((prix_actuel - prix_hier) / prix_hier) * 100, 3)
+        if variation <= -0.3:
+            print(f"  DXY baisse ({variation}%) = BULLISH Gold")
+            return "BULLISH_GOLD", variation
+        elif variation >= 0.3:
+            print(f"  DXY monte ({variation}%) = BEARISH Gold")
+            return "BEARISH_GOLD", variation
+        else:
+            print(f"  DXY neutre ({variation}%)")
+            return "NEUTRE", variation
+    except Exception as e:
+        print(f"  DXY : {e}")
+        return "NEUTRE", 0
+
+# ══════════════════════════════
+# COT REPORT (CFTC) — positions des gros acteurs
+# Publié chaque vendredi, données de la semaine précédente
+# ══════════════════════════════
+def get_cot_gold():
+    """
+    Le COT Report montre les positions des Non-Commercials (spéculateurs institutionnels)
+    Si les longs augmentent = institutionnels haussiers sur le Gold
+    Si les shorts augmentent = institutionnels baissiers sur le Gold
+    Source : CFTC (gratuit) via API publique
+    """
+    try:
+        url = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json?market_and_exchange_names=GOLD%20-%20COMMODITY%20EXCHANGE%20INC.&$limit=2&$order=report_date_as_yyyy_mm_dd%20DESC"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, timeout=15, headers=headers)
+        data = r.json()
+        if not data or len(data) < 2:
+            print("  COT : donnees insuffisantes")
+            return "NEUTRE", 0, 0
+        semaine_recente = data[0]
+        semaine_ancienne = data[1]
+        longs_recents  = int(semaine_recente.get("noncomm_positions_long_all", 0))
+        shorts_recents = int(semaine_recente.get("noncomm_positions_short_all", 0))
+        longs_anciens  = int(semaine_ancienne.get("noncomm_positions_long_all", 0))
+        shorts_anciens = int(semaine_ancienne.get("noncomm_positions_short_all", 0))
+        variation_longs  = longs_recents  - longs_anciens
+        variation_shorts = shorts_recents - shorts_anciens
+        net_position = longs_recents - shorts_recents
+        net_ancien   = longs_anciens - shorts_anciens
+        variation_net = net_position - net_ancien
+        if variation_net > 5000:
+            print(f"  COT : institutionnels ACHETEURS Gold (+{variation_net} nets)")
+            return "BULLISH", longs_recents, shorts_recents
+        elif variation_net < -5000:
+            print(f"  COT : institutionnels VENDEURS Gold ({variation_net} nets)")
+            return "BEARISH", longs_recents, shorts_recents
+        else:
+            print(f"  COT : institutionnels NEUTRES Gold ({variation_net} nets)")
+            return "NEUTRE", longs_recents, shorts_recents
+    except Exception as e:
+        print(f"  COT : {e}")
+        return "NEUTRE", 0, 0
 
 # ══════════════════════════════
 # DONNÉES TWELVE DATA
@@ -265,7 +350,7 @@ def biais_htf(paire):
 # MOTEUR PRINCIPAL — STRATÉGIE SIMPLIFIÉE
 # La règle d'or : Prix + Structure + 1 confirmation
 # ══════════════════════════════
-def analyser(paire, candles, sentiment, annonce_eco, impact_gold):
+def analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal='NEUTRE', cot_signal='NEUTRE'):
     global trades_du_jour
     if trades_du_jour >= MAX_TRADES_JOUR: return None
     if annonce_eco: return None
@@ -336,7 +421,20 @@ def analyser(paire, candles, sentiment, annonce_eco, impact_gold):
     if sentiment == "BULLISH": score_b += 1; conf_b.append("Sentiment news haussier")
     if sentiment == "BEARISH": score_s += 1; conf_s.append("Sentiment news baissier")
 
-    # 10. BONUS GOLD
+    # 10. BONUS GOLD — DXY + COT + Macro
+    if "XAU" in paire:
+        # DXY — corrélation inverse forte
+        if dxy_signal == "BULLISH_GOLD":
+            score_b += 2; conf_b.append("DXY en baisse - favorable Gold")
+        elif dxy_signal == "BEARISH_GOLD":
+            score_s += 2; conf_s.append("DXY en hausse - défavorable Gold")
+
+        # COT Report — positions institutionnelles
+        if cot_signal == "BULLISH":
+            score_b += 2; conf_b.append("COT : institutionnels acheteurs Gold")
+        elif cot_signal == "BEARISH":
+            score_s += 2; conf_s.append("COT : institutionnels vendeurs Gold")
+
     if "XAU" in paire:
         if impact_gold == "BULLISH": score_b += 2; conf_b.append("Annonce macro favorable Gold")
         if impact_gold == "BEARISH": score_s += 2; conf_s.append("Annonce macro defavorable Gold")
@@ -442,12 +540,37 @@ def main():
         annonce_eco, nom_annonce, impact_gold = get_annonces_eco()
         time.sleep(5)
 
+        # DXY et COT pour le Gold
+        print(f"  Analyse DXY...")
+        dxy_signal, dxy_variation = get_dxy()
+        time.sleep(5)
+
+        print(f"  Lecture COT Report CFTC...")
+        cot_signal, cot_longs, cot_shorts = get_cot_gold()
+        time.sleep(5)
+
+        # Alerte si DXY ou COT fort
+        if dxy_signal == "BULLISH_GOLD" and cot_signal == "BULLISH":
+            envoyer_telegram(
+                "CONFLUENCE GOLD FORTE\n"
+                "DXY en baisse (" + str(dxy_variation) + "%)\n"
+                "COT : institutionnels acheteurs\n"
+                "Biais semaine : HAUSSIER sur XAU/USD"
+            )
+        elif dxy_signal == "BEARISH_GOLD" and cot_signal == "BEARISH":
+            envoyer_telegram(
+                "CONFLUENCE GOLD FORTE\n"
+                "DXY en hausse (+" + str(dxy_variation) + "%)\n"
+                "COT : institutionnels vendeurs\n"
+                "Biais semaine : BAISSIER sur XAU/USD"
+            )
+
         for paire in PAIRES:
             print(f"  Analyse {paire}...")
             sentiment = get_sentiment(paire)
             time.sleep(3)
             candles = get_candles(paire, "15min", 50)
-            signal  = analyser(paire, candles, sentiment, annonce_eco, impact_gold)
+            signal  = analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal, cot_signal)
             if signal:
                 envoyer_telegram(signal)
             else:
