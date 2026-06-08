@@ -3,6 +3,12 @@ import time
 import json
 from datetime import datetime
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
+
+TZ_PARIS = ZoneInfo('Europe/Paris')
+
+def now():
+    return datetime.now(TZ_PARIS)
 
 TELEGRAM_TOKEN = "8690688254:AAHYhv2u3kufZob" + "-" + "yMFICeq7feEUj9CEz2E"
 CHAT_ID = "916618328"
@@ -13,20 +19,20 @@ MAX_TRADES_JOUR = 3
 ATR_SL = 1.5
 
 trades_du_jour = 0
-dernier_jour = datetime.now().day
+dernier_jour = now().day
 
 # ══════════════════════════════
 # SESSIONS
 # ══════════════════════════════
 def nom_session():
-    h = datetime.now().hour
+    h = now().hour
     if 8 <= h <= 10: return "Londres"
     if 14 <= h <= 16: return "New York"
     if 1 <= h <= 7: return "Tokyo"
     return "Inter-session"
 
 def session_gold_optimale():
-    h = datetime.now().hour
+    h = now().hour
     return (8 <= h <= 10) or (14 <= h <= 16)
 
 # ══════════════════════════════
@@ -38,7 +44,7 @@ def envoyer_telegram(message):
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram OK")
+            print(f"[{now().strftime('%H:%M:%S')}] Telegram OK")
         else:
             print(f"Erreur Telegram : {r.text}")
     except Exception as e:
@@ -53,7 +59,7 @@ def get_annonces_eco():
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=15)
         html = r.text
-        today = datetime.now().strftime("%b %d")
+        today = now().strftime("%b %d")
         annonces_bull_gold = {
             "CPI": "Inflation haute = Gold monte",
             "NFP": "NFP faible possible = Gold monte",
@@ -322,6 +328,202 @@ def fvg(candles):
         if n["high"] < p["low"]:  fs = (n["high"], p["low"])
     return fb, fs
 
+# ══════════════════════════════
+# LIQUIDITÉS ICT
+# ══════════════════════════════
+
+def detecter_equal_highs_lows(candles):
+    """
+    Equal Highs (EQH) = niveaux où le prix a buté plusieurs fois
+    Equal Lows (EQL) = niveaux où le prix a rebondi plusieurs fois
+    Les institutionnels vont chercher ces niveaux pour chasser les stops
+    """
+    if len(candles) < 10:
+        return None, None
+
+    highs  = [c["high"]  for c in candles[:15]]
+    lows   = [c["low"]   for c in candles[:15]]
+    prix   = candles[0]["close"]
+    marge  = prix * 0.0005  # 0.05% de marge
+
+    # Cherche Equal Highs — stops des vendeurs au-dessus
+    eqh = None
+    for i in range(len(highs) - 1):
+        for j in range(i + 1, len(highs)):
+            if abs(highs[i] - highs[j]) <= marge:
+                eqh = (highs[i] + highs[j]) / 2
+                break
+
+    # Cherche Equal Lows — stops des acheteurs en-dessous
+    eql = None
+    for i in range(len(lows) - 1):
+        for j in range(i + 1, len(lows)):
+            if abs(lows[i] - lows[j]) <= marge:
+                eql = (lows[i] + lows[j]) / 2
+                break
+
+    return round(eqh, 5) if eqh else None, round(eql, 5) if eql else None
+
+def detecter_bsl_ssl(candles):
+    """
+    BSL (Buy Side Liquidity) = liquidité au-dessus des highs récents
+    SSL (Sell Side Liquidity) = liquidité en-dessous des lows récents
+    Le prix va chasser ces zones avant de repartir dans la direction opposée
+    """
+    if len(candles) < 20:
+        return None, None, False, False
+
+    prix        = candles[0]["close"]
+    recent_high = max(c["high"] for c in candles[1:20])
+    recent_low  = min(c["low"]  for c in candles[1:20])
+
+    # BSL = stops des vendeurs au-dessus du dernier high
+    bsl = round(recent_high * 1.0002, 5)
+    # SSL = stops des acheteurs en-dessous du dernier low
+    ssl = round(recent_low  * 0.9998, 5)
+
+    # Est-ce que le prix vient de chasser la BSL ? (sweep haussier -> signal baissier)
+    bsl_swept = candles[0]["high"] > recent_high and candles[0]["close"] < recent_high
+    # Est-ce que le prix vient de chasser la SSL ? (sweep baissier -> signal haussier)
+    ssl_swept = candles[0]["low"]  < recent_low  and candles[0]["close"] > recent_low
+
+    return bsl, ssl, bsl_swept, ssl_swept
+
+def detecter_inducement(candles):
+    """
+    L inducement ICT = faux signal qui attire les retail traders
+    avant que le prix parte dans la vraie direction
+    On cherche une mèche qui dépasse un niveau clé puis revient
+    """
+    if len(candles) < 5:
+        return None
+
+    c    = candles[0]
+    prev = candles[1]
+
+    # Mèche haute dépasse le high précédent mais close en dessous = inducement baissier
+    if c["high"] > prev["high"] and c["close"] < prev["high"]:
+        return "BEAR_INDUCEMENT"
+
+    # Mèche basse dépasse le low précédent mais close au-dessus = inducement haussier
+    if c["low"] < prev["low"] and c["close"] > prev["low"]:
+        return "BULL_INDUCEMENT"
+
+    return None
+
+def detecter_liquidite_sessions(candles):
+    """
+    Liquidités de sessions ICT :
+    - Asian High/Low = niveaux créés pendant la session asiatique
+      que Londres et NY vont chasser
+    - London High/Low = niveaux créés pendant Londres
+      que NY va chasser
+    - Midnight Open = niveau d ouverture à minuit UTC
+      référence clé ICT pour la journée
+    - Opening Range = range des 15 premières minutes de session
+      les institutionnels reviennent souvent tester ce range
+    """
+    if not candles or len(candles) < 30:
+        return {}
+
+    h = now().hour
+    prix = candles[0]["close"]
+
+    resultats = {}
+
+    # Asian High/Low (1h-7h heure Paris)
+    # Londres va souvent chasser ces niveaux pour prendre la liquidité
+    bougies_asie = [c for c in candles[4:20]]  # approximation session asie
+    if bougies_asie:
+        asian_high = max(c["high"] for c in bougies_asie)
+        asian_low  = min(c["low"]  for c in bougies_asie)
+        resultats["asian_high"] = round(asian_high, 2)
+        resultats["asian_low"]  = round(asian_low,  2)
+
+        # Prix au-dessus Asian High = BSL asiatique chassée = potentiel retournement
+        if candles[0]["high"] > asian_high and candles[0]["close"] < asian_high:
+            resultats["asian_bsl_swept"] = True
+        # Prix en-dessous Asian Low = SSL asiatique chassée = potentiel rebond
+        if candles[0]["low"] < asian_low and candles[0]["close"] > asian_low:
+            resultats["asian_ssl_swept"] = True
+
+    # London High/Low (8h-12h heure Paris)
+    # NY va souvent chasser ces niveaux
+    if h >= 14:  # On est en session NY, on peut calculer le range Londres
+        bougies_londres = candles[:8]  # 8 bougies de 15min = 2h
+        if bougies_londres:
+            london_high = max(c["high"] for c in bougies_londres)
+            london_low  = min(c["low"]  for c in bougies_londres)
+            resultats["london_high"] = round(london_high, 2)
+            resultats["london_low"]  = round(london_low,  2)
+
+            # NY chasse le London High = signal baissier
+            if candles[0]["high"] > london_high and candles[0]["close"] < london_high:
+                resultats["london_bsl_swept"] = True
+            # NY chasse le London Low = signal haussier
+            if candles[0]["low"] < london_low and candles[0]["close"] > london_low:
+                resultats["london_ssl_swept"] = True
+
+    # Opening Range (15 premières minutes de la session)
+    # Zone clé — les institutionnels reviennent tester
+    bougies_open = candles[:2]  # 2 premières bougies de 15min
+    if bougies_open:
+        or_high = max(c["high"] for c in bougies_open)
+        or_low  = min(c["low"]  for c in bougies_open)
+        resultats["or_high"] = round(or_high, 2)
+        resultats["or_low"]  = round(or_low,  2)
+
+        # Prix entre le range = neutre
+        # Prix qui revient sur le range après en être sorti = signal
+        if prix < or_low:
+            resultats["sous_opening_range"] = True
+        elif prix > or_high:
+            resultats["dessus_opening_range"] = True
+
+    # Previous Day High/Low — niveaux clés quotidiens
+    # Les institutionnels chassent souvent ces niveaux
+    if len(candles) >= 96:  # 96 bougies de 15min = 24h
+        bougies_hier = candles[48:96]  # bougies d hier approximation
+        pdh = max(c["high"] for c in bougies_hier)
+        pdl = min(c["low"]  for c in bougies_hier)
+        resultats["pdh"] = round(pdh, 2)
+        resultats["pdl"] = round(pdl, 2)
+
+        # Prix qui chasse le PDH puis revient = signal baissier
+        if candles[0]["high"] > pdh and candles[0]["close"] < pdh:
+            resultats["pdh_swept"] = True
+        # Prix qui chasse le PDL puis revient = signal haussier
+        if candles[0]["low"] < pdl and candles[0]["close"] > pdl:
+            resultats["pdl_swept"] = True
+
+    return resultats
+
+def detecter_void_liquidity(candles):
+    """
+    Void = zone où le prix est passé très vite sans volume
+    Le prix reviendra combler cette zone (comme un FVG mais plus large)
+    """
+    if len(candles) < 5:
+        return None, None
+
+    void_bull = void_bear = None
+
+    for i in range(1, len(candles) - 1):
+        c     = candles[i]
+        avant = candles[i + 1]
+        apres = candles[i - 1]
+
+        # Grande bougie haussière = void baissier potentiel (le prix reviendra)
+        body = abs(c["close"] - c["open"])
+        if c["close"] > c["open"] and body > (c["high"] - c["low"]) * 0.8:
+            void_bull = (c["open"], c["close"])
+
+        # Grande bougie baissière = void haussier potentiel
+        if c["close"] < c["open"] and body > (c["high"] - c["low"]) * 0.8:
+            void_bear = (c["close"], c["open"])
+
+    return void_bull, void_bear
+
 def choch(candles):
     if len(candles) < 10: return None
     rh = max(c["high"] for c in candles[1:10])
@@ -417,6 +619,100 @@ def analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal='NE
     if choch_val == "BULL": score_b += 2; conf_b.append("ChoCh haussier - liquidite chassee")
     if choch_val == "BEAR": score_s += 2; conf_s.append("ChoCh baissier - liquidite chassee")
 
+    # 8b. LIQUIDITES ICT + SESSIONS
+    liq_sessions = detecter_liquidite_sessions(candles)
+
+    # Asian SSL swept = stops asiatiques chassés = BUY signal
+    if liq_sessions.get("asian_ssl_swept"):
+        score_b += 3
+        conf_b.append("Asian SSL sweep - stops asiatiques chassés - rebond haussier")
+
+    # Asian BSL swept = stops asiatiques chassés = SELL signal
+    if liq_sessions.get("asian_bsl_swept"):
+        score_s += 3
+        conf_s.append("Asian BSL sweep - stops asiatiques chassés - retournement baissier")
+
+    # London SSL swept = NY chasse les lows Londres = BUY
+    if liq_sessions.get("london_ssl_swept"):
+        score_b += 3
+        conf_b.append("London SSL sweep - NY chasse liquidite Londres - signal haussier")
+
+    # London BSL swept = NY chasse les highs Londres = SELL
+    if liq_sessions.get("london_bsl_swept"):
+        score_s += 3
+        conf_s.append("London BSL sweep - NY chasse liquidite Londres - signal baissier")
+
+    # PDH swept = Previous Day High chassé = retournement baissier
+    if liq_sessions.get("pdh_swept"):
+        score_s += 2
+        conf_s.append(f"PDH sweepé ({liq_sessions.get('pdh')}) - retournement baissier")
+
+    # PDL swept = Previous Day Low chassé = retournement haussier
+    if liq_sessions.get("pdl_swept"):
+        score_b += 2
+        conf_b.append(f"PDL sweepé ({liq_sessions.get('pdl')}) - retournement haussier")
+
+    # Opening Range — prix qui revient tester
+    if liq_sessions.get("sous_opening_range"):
+        score_b += 1
+        conf_b.append(f"Prix sous Opening Range ({liq_sessions.get('or_low')}) - zone support")
+    if liq_sessions.get("dessus_opening_range"):
+        score_s += 1
+        conf_s.append(f"Prix dessus Opening Range ({liq_sessions.get('or_high')}) - zone resistance")
+
+    # Asian High/Low comme niveaux de référence
+    if liq_sessions.get("asian_high") and liq_sessions.get("asian_low"):
+        ah = liq_sessions["asian_high"]
+        al = liq_sessions["asian_low"]
+        if abs(prix - al) / prix < 0.001:
+            score_b += 1
+            conf_b.append(f"Prix sur Asian Low ({al}) - zone support")
+        if abs(prix - ah) / prix < 0.001:
+            score_s += 1
+            conf_s.append(f"Prix sur Asian High ({ah}) - zone resistance")
+
+    # LIQUIDITES ICT classiques
+    eqh, eql         = detecter_equal_highs_lows(candles)
+    bsl, ssl, bsl_swept, ssl_swept = detecter_bsl_ssl(candles)
+    inducement        = detecter_inducement(candles)
+    void_bull, void_bear = detecter_void_liquidity(candles)
+
+    # SSL Swept = stops des acheteurs chassés = signal BUY (retournement haussier)
+    if ssl_swept:
+        score_b += 3
+        conf_b.append(f"SSL sweep - stops retail chassés - retournement haussier probable")
+
+    # BSL Swept = stops des vendeurs chassés = signal SELL (retournement baissier)
+    if bsl_swept:
+        score_s += 3
+        conf_s.append(f"BSL sweep - stops retail chassés - retournement baissier probable")
+
+    # Equal Lows = zone de liquidité en dessous = attention si prix s approche
+    if eql and abs(prix - eql) / prix < 0.002:
+        score_b += 1
+        conf_b.append(f"Equal Lows proches ({round(eql,2)}) - zone de liquidite")
+
+    # Equal Highs = zone de liquidité au dessus = attention si prix s approche
+    if eqh and abs(prix - eqh) / prix < 0.002:
+        score_s += 1
+        conf_s.append(f"Equal Highs proches ({round(eqh,2)}) - zone de liquidite")
+
+    # Inducement
+    if inducement == "BULL_INDUCEMENT":
+        score_b += 2
+        conf_b.append("Inducement haussier - faux signal baissier detecte")
+    if inducement == "BEAR_INDUCEMENT":
+        score_s += 2
+        conf_s.append("Inducement baissier - faux signal haussier detecte")
+
+    # Void
+    if void_bear and void_bear[0] <= prix <= void_bear[1]:
+        score_b += 1
+        conf_b.append(f"Void haussier a combler ({round(void_bear[0],2)}-{round(void_bear[1],2)})")
+    if void_bull and void_bull[0] <= prix <= void_bull[1]:
+        score_s += 1
+        conf_s.append(f"Void baissier a combler ({round(void_bull[0],2)}-{round(void_bull[1],2)})")
+
     # 9. SENTIMENT NEWS
     if sentiment == "BULLISH": score_b += 1; conf_b.append("Sentiment news haussier")
     if sentiment == "BEARISH": score_s += 1; conf_s.append("Sentiment news baissier")
@@ -497,7 +793,7 @@ def analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal='NE
         f"Pourquoi ce signal :\n" +
         "\n".join(f"- {c}" for c in conf[:7]) +
         gold_note +
-        f"\n\n{datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        f"\n\n{now().strftime('%d/%m/%Y %H:%M')}"
     )
 
     trades_du_jour += 1
@@ -508,9 +804,9 @@ def analyser(paire, candles, sentiment, annonce_eco, impact_gold, dxy_signal='NE
 # ══════════════════════════════
 def reset():
     global trades_du_jour, dernier_jour
-    if datetime.now().day != dernier_jour:
+    if now().day != dernier_jour:
         trades_du_jour = 0
-        dernier_jour   = datetime.now().day
+        dernier_jour   = now().day
         envoyer_telegram("Nouveau jour - compteurs remis a zero.")
 
 # ══════════════════════════════
@@ -535,7 +831,7 @@ def main():
 
     while True:
         reset()
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Nouvelle analyse...")
+        print(f"\n[{now().strftime('%H:%M:%S')}] Nouvelle analyse...")
 
         annonce_eco, nom_annonce, impact_gold = get_annonces_eco()
         time.sleep(5)
