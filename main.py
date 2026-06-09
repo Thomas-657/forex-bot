@@ -362,6 +362,137 @@ def patterns(candles):
     return res
 
 # ══════════════════════════════
+# ANALYSE H4 — CONTEXTE ET ZONE D INTERET
+# ══════════════════════════════
+def analyse_h4(paire):
+    """
+    H4 definit le contexte et la zone d interet
+    - Tendance H4 via EMA 21/50/200
+    - Structure BOS/ChoCh H4
+    - Order Block H4 = zone ou le prix va reagir
+    - FVG H4 = desequilibre a combler
+    - Equal Highs/Lows H4 = liquidite a chasser
+    - Premium/Discount = est-on haut ou bas dans le range ?
+    """
+    candles = get_candles(paire, "4h", 50) if paire != "XAU/USD" else get_candles(paire, "60min", 50)
+    if not candles or len(candles) < 20:
+        return {"biais": "NEUTRE", "zones": [], "zone_interet": None}
+    time.sleep(5)
+
+    closes = [c["close"] for c in candles]
+    prix   = closes[0]
+
+    e21  = ema(closes, 21)
+    e50  = ema(closes, 50) if len(closes) >= 50 else None
+    e200 = ema(closes, min(200, len(closes)))
+    rsi_h4 = rsi(closes, 14)
+    macd_l, macd_s, macd_h = macd(closes, 12, 26, 9)
+    bb_up, bb_mid, bb_low = bollinger(closes, 20)
+    bos_h4 = structure(candles)
+    ob_b_h4, ob_s_h4 = order_block(candles)
+    fvg_b_h4, fvg_s_h4 = fvg(candles)
+    choch_h4 = choch(candles)
+
+    # Premium / Discount
+    high_h4 = max(c["high"] for c in candles[:20])
+    low_h4  = min(c["low"]  for c in candles[:20])
+    range_h4 = high_h4 - low_h4
+    position = (prix - low_h4) / range_h4 if range_h4 > 0 else 0.5
+    en_discount = position < 0.35  # Prix dans les 35% bas du range
+    en_premium  = position > 0.65  # Prix dans les 65% haut du range
+
+    # Equal Highs/Lows H4
+    highs = [c["high"] for c in candles[:15]]
+    lows  = [c["low"]  for c in candles[:15]]
+    marge = prix * 0.0005
+    eqh = eql = None
+    for i in range(len(highs)-1):
+        for j in range(i+1, len(highs)):
+            if abs(highs[i] - highs[j]) <= marge:
+                eqh = round((highs[i]+highs[j])/2, 2); break
+    for i in range(len(lows)-1):
+        for j in range(i+1, len(lows)):
+            if abs(lows[i] - lows[j]) <= marge:
+                eql = round((lows[i]+lows[j])/2, 2); break
+
+    score_bull = 0
+    score_bear = 0
+    zones_bull = []
+    zones_bear = []
+
+    # Structure H4
+    if bos_h4 == "BULLISH": score_bull += 2; zones_bull.append("BOS haussier H4")
+    if bos_h4 == "BEARISH": score_bear += 2; zones_bear.append("BOS baissier H4")
+
+    # ChoCh H4
+    if choch_h4 == "BULL": score_bull += 3; zones_bull.append("ChoCh haussier H4 - retournement")
+    if choch_h4 == "BEAR": score_bear += 3; zones_bear.append("ChoCh baissier H4 - retournement")
+
+    # EMA H4
+    if e21 and e50 and prix > e21 > e50:
+        score_bull += 2; zones_bull.append("EMA alignees haussier H4")
+    if e21 and e50 and prix < e21 < e50:
+        score_bear += 2; zones_bear.append("EMA alignees baissier H4")
+    if e200:
+        if prix > e200: score_bull += 1; zones_bull.append("Prix dessus EMA200 H4")
+        else:           score_bear += 1; zones_bear.append("Prix dessous EMA200 H4")
+
+    # MACD H4
+    if macd_l and macd_s:
+        if macd_l > macd_s and macd_h and macd_h > 0:
+            score_bull += 2; zones_bull.append("MACD haussier H4")
+        if macd_l < macd_s and macd_h and macd_h < 0:
+            score_bear += 2; zones_bear.append("MACD baissier H4")
+
+    # RSI H4
+    if rsi_h4:
+        if rsi_h4 < 40:  score_bull += 1; zones_bull.append(f"RSI survendu H4 ({rsi_h4})")
+        if rsi_h4 > 60:  score_bear += 1; zones_bear.append(f"RSI surachete H4 ({rsi_h4})")
+
+    # Bollinger H4
+    if bb_low and prix <= bb_low: score_bull += 1; zones_bull.append("Prix bande basse Bollinger H4")
+    if bb_up  and prix >= bb_up:  score_bear += 1; zones_bear.append("Prix bande haute Bollinger H4")
+
+    # Order Block H4
+    if ob_b_h4 and ob_b_h4[0] <= prix <= ob_b_h4[1]:
+        score_bull += 3; zones_bull.append(f"Order Block haussier H4 ({round(ob_b_h4[0],2)}-{round(ob_b_h4[1],2)})")
+    if ob_s_h4 and ob_s_h4[0] <= prix <= ob_s_h4[1]:
+        score_bear += 3; zones_bear.append(f"Order Block baissier H4 ({round(ob_s_h4[0],2)}-{round(ob_s_h4[1],2)})")
+
+    # FVG H4
+    if fvg_b_h4 and fvg_b_h4[0] <= prix <= fvg_b_h4[1]:
+        score_bull += 2; zones_bull.append(f"FVG haussier H4 ({round(fvg_b_h4[0],2)}-{round(fvg_b_h4[1],2)})")
+    if fvg_s_h4 and fvg_s_h4[0] <= prix <= fvg_s_h4[1]:
+        score_bear += 2; zones_bear.append(f"FVG baissier H4 ({round(fvg_s_h4[0],2)}-{round(fvg_s_h4[1],2)})")
+
+    # Premium / Discount
+    if en_discount: score_bull += 1; zones_bull.append(f"Zone Discount H4 ({round(position*100)}% du range)")
+    if en_premium:  score_bear += 1; zones_bear.append(f"Zone Premium H4 ({round(position*100)}% du range)")
+
+    # Equal Highs/Lows
+    if eql and abs(prix - eql) / prix < 0.002:
+        score_bull += 1; zones_bull.append(f"Equal Lows H4 ({eql}) - liquidite a chasser")
+    if eqh and abs(prix - eqh) / prix < 0.002:
+        score_bear += 1; zones_bear.append(f"Equal Highs H4 ({eqh}) - liquidite a chasser")
+
+    # Zone d interet pour H1
+    zone_interet = None
+    if score_bull >= 4 and ob_b_h4:
+        zone_interet = ob_b_h4
+    elif score_bull >= 4 and fvg_b_h4:
+        zone_interet = fvg_b_h4
+    elif score_bear >= 4 and ob_s_h4:
+        zone_interet = ob_s_h4
+    elif score_bear >= 4 and fvg_s_h4:
+        zone_interet = fvg_s_h4
+
+    if score_bull >= 4 and score_bull > score_bear:
+        return {"biais": "BULLISH", "score": score_bull, "zones": zones_bull, "zone_interet": zone_interet, "ob_bull": ob_b_h4, "fvg_bull": fvg_b_h4, "eql": eql, "discount": en_discount}
+    elif score_bear >= 4 and score_bear > score_bull:
+        return {"biais": "BEARISH", "score": score_bear, "zones": zones_bear, "zone_interet": zone_interet, "ob_bear": ob_s_h4, "fvg_bear": fvg_s_h4, "eqh": eqh, "premium": en_premium}
+    return {"biais": "NEUTRE", "score": 0, "zones": [], "zone_interet": None}
+
+# ══════════════════════════════
 # ANALYSE H1 — BIAIS DIRECTIONNEL
 # ══════════════════════════════
 def analyse_h1(paire):
@@ -448,9 +579,9 @@ def analyse_h1(paire):
 
     # Determination du biais H1
     if score_bull >= 4 and score_bull > score_bear:
-        return {"biais": "BULLISH", "score": score_bull, "zones": zones_bull, "rsi": rsi_h1, "ob_bull": ob_b_h1, "fvg_bull": fvg_b_h1}
+        return {"biais": "BULLISH", "score": score_bull, "zones": zones_bull, "rsi": rsi_h1, "ob_bull": ob_b_h1, "fvg_bull": fvg_b_h1, "choch": choch_h1}
     elif score_bear >= 4 and score_bear > score_bull:
-        return {"biais": "BEARISH", "score": score_bear, "zones": zones_bear, "rsi": rsi_h1, "ob_bear": ob_s_h1, "fvg_bear": fvg_s_h1}
+        return {"biais": "BEARISH", "score": score_bear, "zones": zones_bear, "rsi": rsi_h1, "ob_bear": ob_s_h1, "fvg_bear": fvg_s_h1, "choch": choch_h1}
     return {"biais": "NEUTRE", "score": 0, "zones": []}
 
 # ══════════════════════════════
@@ -654,7 +785,9 @@ def analyser(paire, candles_m15, h1_data, sentiment, annonce_eco, impact_gold, d
         f"TP1 (40%) : {tp1}\n"
         f"TP2 (35%) : {tp2}\n"
         f"TP3 (25%) : {tp3}\n\n"
-        f"Analyse H1 :\n" +
+        f"Analyse H4 :\n" +
+        "\n".join(f"- {c}" for c in (h4_data.get('zones', [])[:3] if h4_data else [])) +
+        f"\n\nAnalyse H1 :\n" +
         "\n".join(f"- {c}" for c in conf_h1[:3]) +
         f"\n\nConfirmation M15 :\n" +
         "\n".join(f"- {c}" for c in conf_m15[:6]) +
@@ -682,10 +815,11 @@ def reset():
 def main():
     print("Bot H1 + M15 demarre !")
     envoyer_telegram(
-        "Bot demarre - Analyse H1 + Confirmation M15\n\n"
+        "Bot demarre - Analyse H4 + H1 + Confirmation M15\n\n"
         "Logique :\n"
-        "1. Biais H1 (structure + EMA + MACD + Bollinger)\n"
-        "2. Confirmation M15 (SMC + liquidites + patterns)\n\n"
+        "1. Contexte H4 (zone interet + SMC)\n"
+        "2. Setup H1 (confirmation + ChoCh)\n"
+        "3. Declencheur M15 (entree precise)\n\n"
         "Indicateurs H1 :\n"
         "- Structure BOS + ChoCh\n"
         "- EMA 21/50/200\n"
@@ -725,12 +859,22 @@ def main():
             envoyer_telegram("CONFLUENCE GOLD FORTE\nDXY monte + COT vendeurs\nBiais semaine : BAISSIER XAU/USD")
 
         for paire in PAIRES:
+            print(f"  [{paire}] Analyse H4...")
+            h4_data = analyse_h4(paire)
+            print(f"  [{paire}] Biais H4 : {h4_data['biais']}")
+
+            if h4_data["biais"] == "NEUTRE":
+                print(f"  [{paire}] H4 neutre - pas de trade")
+                time.sleep(5)
+                continue
+
             print(f"  [{paire}] Analyse H1...")
             h1_data = analyse_h1(paire)
             print(f"  [{paire}] Biais H1 : {h1_data['biais']}")
 
-            if h1_data["biais"] == "NEUTRE":
-                print(f"  [{paire}] Biais neutre - pas de trade")
+            # H1 doit confirmer H4
+            if h1_data["biais"] != h4_data["biais"]:
+                print(f"  [{paire}] H1 pas aligne avec H4 - pas de trade")
                 time.sleep(5)
                 continue
 
@@ -741,7 +885,7 @@ def main():
             sentiment = get_sentiment(paire)
             time.sleep(3)
 
-            signal = analyser(paire, candles_m15, h1_data, sentiment, annonce_eco, impact_gold, dxy_signal, cot_signal)
+            signal = analyser(paire, candles_m15, h1_data, sentiment, annonce_eco, impact_gold, dxy_signal, cot_signal, h4_data)
 
             if signal:
                 envoyer_telegram(signal)
