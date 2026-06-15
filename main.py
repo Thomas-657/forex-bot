@@ -1,10 +1,9 @@
 import os
 import csv
 import time
+import math
 import logging
 import requests
-import pandas as pd
-import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +60,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("LCT")
 
+# ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -73,52 +73,104 @@ def send_telegram(text):
             timeout=10,
         )
         r.raise_for_status()
-        log.info("Telegram OK")
     except Exception as e:
-        log.error("Telegram erreur : {}".format(e))
+        log.error("Telegram : {}".format(e))
 
+# ─── INDICATEURS (Python pur, zéro librairie) ────────────────────────────────
 
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def calc_ema(values, period):
+    """EMA avec lissage ewm — identique TradingView."""
+    k   = 2.0 / (period + 1)
+    ema = values[0]
+    result = [ema]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+        result.append(ema)
+    return result
 
+def calc_rsi(closes, period=14):
+    """RSI de Wilder."""
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
 
-def calc_rsi(series, period=14):
-    delta    = series.diff()
-    gain     = delta.clip(lower=0)
-    loss     = delta.clip(upper=0).abs()
-    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = avg_loss.replace(0, 1e-10)
-    rs       = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    if len(gains) < period:
+        return [50.0] * len(closes)
 
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsi_vals = [50.0] * (period + 1)
 
-def calc_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = calc_ema(series, fast)
-    ema_slow = calc_ema(series, slow)
-    line     = ema_fast - ema_slow
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi_vals.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_vals.append(100.0 - (100.0 / (1.0 + rs)))
+
+    return rsi_vals
+
+def calc_macd(closes, fast=12, slow=26, signal=9):
+    """Retourne (macd_line, signal_line, histogram) — listes de même longueur."""
+    ema_fast = calc_ema(closes, fast)
+    ema_slow = calc_ema(closes, slow)
+    line     = [f - s for f, s in zip(ema_fast, ema_slow)]
     sig      = calc_ema(line, signal)
-    return line, sig, line - sig
+    hist     = [l - s for l, s in zip(line, sig)]
+    return line, sig, hist
 
+def calc_cvd(candles, window=20):
+    """CVD simplifié sur `window` bougies : buy vol si close >= open, sinon sell."""
+    deltas = []
+    for c in candles:
+        vol = c["volume"]
+        deltas.append(vol if c["close"] >= c["open"] else -vol)
+    cvd = []
+    for i in range(len(deltas)):
+        start = max(0, i - window + 1)
+        cvd.append(sum(deltas[start:i + 1]))
+    return cvd
 
-def add_indicators(df):
-    df = df.copy()
-    close       = df["close"]
-    df["ema9"]  = calc_ema(close, EMA_FAST)
-    df["ema21"] = calc_ema(close, EMA_SLOW)
-    df["rsi"]   = calc_rsi(close, RSI_PERIOD)
-    ml, ms, mh  = calc_macd(close, MACD_FAST, MACD_SLOW, MACD_SIG)
-    df["macd"]      = ml
-    df["macd_sig"]  = ms
-    df["macd_hist"] = mh
-    df["delta"] = df.apply(
-        lambda r: r["volume"] if r["close"] >= r["open"] else -r["volume"], axis=1
-    )
-    df["cvd"] = df["delta"].rolling(CVD_WINDOW).sum()
-    return df.dropna().reset_index(drop=True)
+def add_indicators(candles):
+    """
+    Ajoute EMA9, EMA21, RSI, MACD, CVD à chaque bougie.
+    Retourne la liste enrichie (même longueur).
+    """
+    closes = [c["close"] for c in candles]
 
+    ema9  = calc_ema(closes, EMA_FAST)
+    ema21 = calc_ema(closes, EMA_SLOW)
+    rsi   = calc_rsi(closes, RSI_PERIOD)
+    ml, ms, mh = calc_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIG)
+    cvd   = calc_cvd(candles, CVD_WINDOW)
+    deltas = [
+        c["volume"] if c["close"] >= c["open"] else -c["volume"]
+        for c in candles
+    ]
+
+    result = []
+    for i, c in enumerate(candles):
+        result.append({
+            **c,
+            "ema9":      ema9[i],
+            "ema21":     ema21[i],
+            "rsi":       rsi[i],
+            "macd":      ml[i],
+            "macd_sig":  ms[i],
+            "macd_hist": mh[i],
+            "cvd":       cvd[i],
+            "delta":     deltas[i],
+        })
+    return result
+
+# ─── DONNÉES ─────────────────────────────────────────────────────────────────
 
 def fetch_candles(symbol, interval, outputsize=100):
+    """Récupère les bougies depuis Twelve Data. Retourne une liste de dicts."""
     try:
         r = requests.get(
             "https://api.twelvedata.com/time_series",
@@ -136,16 +188,28 @@ def fetch_candles(symbol, interval, outputsize=100):
             log.warning("Pas de donnees {} {} : {}".format(
                 symbol, interval, data.get("message", "?")))
             return None
-        df = pd.DataFrame(data["values"]).rename(columns={"datetime": "time"})
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.dropna().reset_index(drop=True)
-        return df if len(df) >= 30 else None
+
+        candles = []
+        for v in data["values"]:
+            try:
+                candles.append({
+                    "time":   v["datetime"],
+                    "open":   float(v["open"]),
+                    "high":   float(v["high"]),
+                    "low":    float(v["low"]),
+                    "close":  float(v["close"]),
+                    "volume": float(v.get("volume", 1)),
+                })
+            except (ValueError, KeyError):
+                continue
+
+        return candles if len(candles) >= 30 else None
+
     except Exception as e:
         log.error("fetch {} {} : {}".format(symbol, interval, e))
         return None
 
+# ─── SESSIONS ────────────────────────────────────────────────────────────────
 
 def get_active_session(now):
     wd, h = now.weekday(), now.hour
@@ -160,6 +224,7 @@ def get_active_session(now):
         return "Asie + Londres ⚡"
     return active[0]
 
+# ─── NEWS ────────────────────────────────────────────────────────────────────
 
 def is_news_blackout(now):
     risky = []
@@ -173,19 +238,18 @@ def is_news_blackout(now):
             risky.append({"name": name, "status": "vient de passer"})
     return bool(risky), risky
 
+# ─── JOURNAL ─────────────────────────────────────────────────────────────────
 
 def init_journal():
     if not JOURNAL_FILE.exists():
         with open(JOURNAL_FILE, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=JOURNAL_COLS).writeheader()
 
-
 def next_id():
     if not JOURNAL_FILE.exists():
         return 1
     with open(JOURNAL_FILE, encoding="utf-8") as f:
         return len(list(csv.DictReader(f))) + 1
-
 
 def save_trade(symbol, direction, score, price, sl, tp,
                session, rsi, macd_hist, cvd, now):
@@ -212,47 +276,49 @@ def save_trade(symbol, direction, score, price, sl, tp,
         })
     return tid
 
-
 def load_journal():
     if not JOURNAL_FILE.exists():
         return []
     with open(JOURNAL_FILE, encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
+# ─── SL / TP ─────────────────────────────────────────────────────────────────
 
-def compute_sl_tp(df5, direction, price):
-    last = df5.iloc[-1]
+def compute_sl_tp(candles, direction, price):
+    last = candles[-1]
     buf  = price * 0.001
     if direction == "long":
-        sl = float(last["ema21"]) - buf
+        sl = last["ema21"] - buf
         tp = price + (price - sl) * 2.0
     else:
-        sl = float(last["ema9"]) + buf
+        sl = last["ema9"] + buf
         tp = price - (sl - price) * 2.0
     return round(sl, 4), round(tp, 4)
 
+# ─── ANALYSE ─────────────────────────────────────────────────────────────────
 
-def analyse_m15(df):
+def analyse_m15(candles):
     res = {"biais": "neutre", "score": 0, "details": []}
-    l, p = df.iloc[-1], df.iloc[-2]
-    up9  = bool(l["ema9"]  > p["ema9"])
-    up21 = bool(l["ema21"] > p["ema21"])
-    c    = float(l["close"])
+    l, p = candles[-1], candles[-2]
+    up9  = l["ema9"]  > p["ema9"]
+    up21 = l["ema21"] > p["ema21"]
+    c    = l["close"]
 
-    if float(l["ema9"]) > float(l["ema21"]) and up9 and up21:
+    if l["ema9"] > l["ema21"] and up9 and up21:
         res["biais"] = "long"
         res["score"] = 1
         res["details"].append("EMA 9 > EMA 21 haussieres ✅")
-        if float(l["ema21"]) <= c <= float(l["ema9"]):
+        if l["ema21"] <= c <= l["ema9"]:
             res["score"] = 2
             res["details"].append("Prix en zone pullback ✅")
         else:
             res["details"].append("Prix hors zone pullback")
-    elif float(l["ema9"]) < float(l["ema21"]) and not up9 and not up21:
+
+    elif l["ema9"] < l["ema21"] and not up9 and not up21:
         res["biais"] = "short"
         res["score"] = 1
         res["details"].append("EMA 9 < EMA 21 baissieres ✅")
-        if float(l["ema9"]) <= c <= float(l["ema21"]):
+        if l["ema9"] <= c <= l["ema21"]:
             res["score"] = 2
             res["details"].append("Prix en zone pullback ✅")
         else:
@@ -261,24 +327,24 @@ def analyse_m15(df):
         res["details"].append("EMA enchevêtrees ❌")
     return res
 
-
-def analyse_m5(df, biais):
+def analyse_m5(candles, biais):
     res = {"score": 0, "details": []}
     if biais not in ("long", "short"):
         return res
 
-    l, p  = df.iloc[-1], df.iloc[-2]
-    rsi   = float(l["rsi"])
-    hist  = float(l["macd_hist"])
-    phist = float(p["macd_hist"])
-    cvd   = float(l["cvd"])
-    pcvd  = float(p["cvd"])
-    delta = float(l["delta"])
-    macd  = float(l["macd"])
-    msig  = float(l["macd_sig"])
-    pmacd = float(p["macd"])
-    pmsig = float(p["macd_sig"])
+    l, p  = candles[-1], candles[-2]
+    rsi   = l["rsi"]
+    hist  = l["macd_hist"]
+    phist = p["macd_hist"]
+    cvd   = l["cvd"]
+    pcvd  = p["cvd"]
+    delta = l["delta"]
+    macd  = l["macd"]
+    msig  = l["macd_sig"]
+    pmacd = p["macd"]
+    pmsig = p["macd_sig"]
 
+    # RSI
     if biais == "long":
         rsi_ok = 35 <= rsi <= 65 or rsi < 35
     else:
@@ -289,6 +355,7 @@ def analyse_m5(df, biais):
     else:
         res["details"].append("RSI {:.1f} defavorable ❌".format(rsi))
 
+    # MACD pas de divergence
     div = (biais == "long"  and hist < 0 and hist < phist) or \
           (biais == "short" and hist > 0 and hist > phist)
     if not div:
@@ -297,6 +364,7 @@ def analyse_m5(df, biais):
     else:
         res["details"].append("Divergence MACD ❌")
 
+    # MACD déclencheur
     cx_up   = pmacd < pmsig and macd > msig
     cx_down = pmacd > pmsig and macd < msig
     if biais == "long":
@@ -309,6 +377,7 @@ def analyse_m5(df, biais):
     else:
         res["details"].append("MACD pas de declencheur ❌")
 
+    # CVD
     cvd_ok = (biais == "long"  and cvd > 0 and cvd >= pcvd) or \
              (biais == "short" and cvd < 0 and cvd <= pcvd)
     if cvd_ok:
@@ -317,15 +386,17 @@ def analyse_m5(df, biais):
     else:
         res["details"].append("CVD non aligne ({:+.0f}) ❌".format(cvd))
 
+    # Delta bougie
     delta_ok = (biais == "long" and delta > 0) or (biais == "short" and delta < 0)
     if delta_ok:
         res["score"] += 1
-        res["details"].append("Delta bougie aligne ({:+.0f}) ✅".format(delta))
+        res["details"].append("Delta aligne ({:+.0f}) ✅".format(delta))
     else:
-        res["details"].append("Delta bougie non aligne ({:+.0f}) ❌".format(delta))
+        res["details"].append("Delta non aligne ({:+.0f}) ❌".format(delta))
 
     return res
 
+# ─── RAPPORT QUOTIDIEN ───────────────────────────────────────────────────────
 
 def build_daily_report(now):
     today      = now.strftime("%Y-%m-%d")
@@ -335,41 +406,40 @@ def build_daily_report(now):
     wins       = [t for t in closed    if t.get("resultat") == "WIN"]
     open_t     = [t for t in t_today   if t.get("resultat") == "EN_COURS"]
 
-    def safe_float(v):
+    def sf(v):
         try:    return float(v)
         except: return 0.0
 
-    day_pnl    = sum(safe_float(t["pnl_r"]) for t in closed)
+    day_pnl    = sum(sf(t["pnl_r"]) for t in closed)
     wr_day     = len(wins) / len(closed) * 100.0 if closed else 0.0
     all_closed = [t for t in all_trades if t.get("resultat") in ("WIN", "LOSS")]
     total_wins = sum(1 for t in all_closed if t.get("resultat") == "WIN")
     wr_all     = total_wins / len(all_closed) * 100.0 if all_closed else 0.0
-    total_pnl  = sum(safe_float(t["pnl_r"]) for t in all_closed)
+    total_pnl  = sum(sf(t["pnl_r"]) for t in all_closed)
     perf       = "🟢" if day_pnl > 0 else ("🔴" if day_pnl < 0 else "⚪")
 
-    by_sym  = {}
-    by_sess = {}
+    by_sym, by_sess = {}, {}
     for t in t_today:
         for d, key in [(by_sym, t.get("symbol","?")), (by_sess, t.get("session","?"))]:
-            d.setdefault(key, {"w": 0, "l": 0, "total": 0})
-            d[key]["total"] += 1
+            d.setdefault(key, {"w": 0, "l": 0, "n": 0})
+            d[key]["n"] += 1
             if t.get("resultat") == "WIN":  d[key]["w"] += 1
             if t.get("resultat") == "LOSS": d[key]["l"] += 1
 
     msg = (
         "📊 <b>RAPPORT — {}</b>\n{}\n\n"
-        "<b>Signaux : {}</b>  ✅ {} clotures  ⏳ {} en cours\n\n"
-        "<b>{} Jour</b>  {}W / {}L  {:.0f}%  {:+.1f}R\n\n"
+        "<b>Signaux : {}</b>  ✅{} clotures  ⏳{} en cours\n\n"
+        "<b>{} Jour :</b> {}W/{}L  {:.0f}%  {:+.1f}R\n\n"
     ).format(
         now.strftime("%d/%m/%Y"), "─" * 28,
         len(t_today), len(closed), len(open_t),
-        perf, len(wins), len(closed) - len(wins), wr_day, day_pnl,
+        perf, len(wins), len(closed)-len(wins), wr_day, day_pnl,
     )
 
     if by_sym:
         msg += "<b>Par instrument</b>\n"
         for sym, s in by_sym.items():
-            wr = s["w"] / (s["w"] + s["l"]) * 100 if s["w"] + s["l"] else 0
+            wr = s["w"]/(s["w"]+s["l"])*100 if s["w"]+s["l"] else 0
             msg += "  {} : {}W/{}L ({:.0f}%)\n".format(sym, s["w"], s["l"], wr)
         msg += "\n"
 
@@ -381,8 +451,8 @@ def build_daily_report(now):
 
     msg += (
         "{}\n<b>Global (paper)</b>\n"
-        "  {} trades  |  {:.0f}% WR  |  {:+.1f}R total\n\n"
-    ).format("─" * 28, len(all_closed), wr_all, total_pnl)
+        "  {} trades  |  {:.0f}% WR  |  {:+.1f}R\n\n"
+    ).format("─"*28, len(all_closed), wr_all, total_pnl)
 
     if len(all_closed) >= 20:
         if wr_all >= 55 and total_pnl > 0:
@@ -398,42 +468,42 @@ def build_daily_report(now):
     if t_today:
         msg += "\n<b>Derniers signaux</b>\n"
         for t in t_today[-5:]:
-            e   = "✅" if t["resultat"] == "WIN" else ("❌" if t["resultat"] == "LOSS" else "⏳")
-            pnl = " {:+.1f}R".format(safe_float(t["pnl_r"])) if t.get("pnl_r") else ""
+            e   = "✅" if t["resultat"]=="WIN" else ("❌" if t["resultat"]=="LOSS" else "⏳")
+            pnl = " {:+.1f}R".format(sf(t["pnl_r"])) if t.get("pnl_r") else ""
             msg += "  {} #{} {} {} @ {}{}\n".format(
                 e, t["id"], t["symbol"], t["direction"], t["prix_entree"], pnl)
 
     msg += "\n📁 <i>journal_trades.csv</i>"
     return msg
 
+# ─── SCAN ────────────────────────────────────────────────────────────────────
 
 last_signal = {}
-
 
 def scan_symbol(symbol, session, now):
     log.info("Scan {}".format(symbol))
 
-    df15 = fetch_candles(symbol, "15min", 80)
-    if df15 is None:
+    raw15 = fetch_candles(symbol, "15min", 80)
+    if not raw15:
         return
-    df15  = add_indicators(df15)
-    m15   = analyse_m15(df15)
+    c15   = add_indicators(raw15)
+    m15   = analyse_m15(c15)
     biais = m15["biais"]
     if biais == "neutre":
         last_signal.pop(symbol, None)
         return
 
-    df5 = fetch_candles(symbol, "5min", 80)
-    if df5 is None:
+    raw5 = fetch_candles(symbol, "5min", 80)
+    if not raw5:
         return
-    df5   = add_indicators(df5)
-    m5    = analyse_m5(df5, biais)
+    c5    = add_indicators(raw5)
+    m5    = analyse_m5(c5, biais)
     score = m15["score"] + m5["score"]
-    last5 = df5.iloc[-1]
-    price = float(last5["close"])
+    last5 = c5[-1]
+    price = last5["close"]
 
     log.info("{} {} {}/7 RSI={:.1f}".format(
-        symbol, biais.upper(), score, float(last5["rsi"])))
+        symbol, biais.upper(), score, last5["rsi"]))
 
     if score >= SCORE_MIN:
         sig_key = "{}_{}".format(symbol, biais)
@@ -441,11 +511,10 @@ def scan_symbol(symbol, session, now):
             log.info("{} doublon — skip".format(symbol))
             return
 
-        sl, tp = compute_sl_tp(df5, biais, price)
+        sl, tp = compute_sl_tp(c5, biais, price)
         tid    = save_trade(
             symbol, biais, score, price, sl, tp, session,
-            float(last5["rsi"]), float(last5["macd_hist"]),
-            float(last5["cvd"]), now,
+            last5["rsi"], last5["macd_hist"], last5["cvd"], now,
         )
 
         emoji = "📈" if biais == "long" else "📉"
@@ -466,7 +535,7 @@ def scan_symbol(symbol, session, now):
             now.strftime("%H:%M UTC"), session,
             score, bar,
             price, sl, risk, tp,
-            float(last5["rsi"]), float(last5["macd_hist"]), float(last5["cvd"]),
+            last5["rsi"], last5["macd_hist"], last5["cvd"],
         )
         msg += "<b>M15 :</b>\n" + "".join("  {}\n".format(d) for d in m15["details"])
         msg += "\n<b>M5 :</b>\n" + "".join("  {}\n".format(d) for d in m5["details"])
@@ -478,6 +547,7 @@ def scan_symbol(symbol, session, now):
     else:
         last_signal.pop(symbol, None)
 
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     init_journal()
@@ -486,14 +556,14 @@ def main():
     news_notified     = False
     report_sent_today = ""
 
-    log.info("=" * 48)
-    log.info("  LE COLLECTIF TRADING — v5")
+    log.info("=" * 46)
+    log.info("  LE COLLECTIF TRADING")
     log.info("  EMA 9/21 + RSI + MACD + CVD")
-    log.info("  Paper trading | Rapport 21h UTC")
-    log.info("=" * 48)
+    log.info("  Zero dependance — Python pur")
+    log.info("=" * 46)
 
     send_telegram(
-        "🤖 <b>Le Collectif Trading — v5</b>\n\n"
+        "🤖 <b>Le Collectif Trading — demarrage</b>\n\n"
         "📊 EMA 9/21 + RSI + MACD + CVD\n"
         "🌍 Asie · Londres · New York\n"
         "🚨 Filtre news actif\n"
@@ -506,21 +576,21 @@ def main():
         try:
             now = datetime.now(timezone.utc)
 
+            # Rapport quotidien
             today = now.strftime("%Y-%m-%d")
             if (now.hour == REPORT_HOUR and
                     now.minute < 2 and
                     report_sent_today != today):
                 send_telegram(build_daily_report(now))
                 report_sent_today = today
-                log.info("Rapport envoye")
 
+            # Filtre news
             blackout, news_list = is_news_blackout(now)
             if blackout:
                 if not news_notified:
                     names = ", ".join(n["name"] for n in news_list)
                     send_telegram(
-                        "🚨 <b>PAUSE NEWS — {}</b>\n"
-                        "{}\n"
+                        "🚨 <b>PAUSE NEWS — {}</b>\n{}\n"
                         "⏸ Aucun signal pendant cette fenetre.".format(
                             now.strftime("%H:%M UTC"), names)
                     )
@@ -529,6 +599,7 @@ def main():
                 continue
             news_notified = False
 
+            # Filtre session
             session = get_active_session(now)
             if session is None:
                 if last_session is not None:
@@ -546,7 +617,7 @@ def main():
                 send_telegram(
                     "📍 <b>Session {}</b> — {}\n"
                     "ℹ️ {}\n"
-                    "🤖 Scan actif — XAU/USD · BTC/USD".format(
+                    "🤖 Scan — XAU/USD · BTC/USD".format(
                         session,
                         now.strftime("%H:%M UTC"),
                         SESSION_TIPS.get(session, "Session active."),
@@ -555,13 +626,13 @@ def main():
                 last_session = session
                 last_signal.clear()
 
+            # Scan
             for symbol in SYMBOLS:
                 scan_symbol(symbol, session, now)
                 time.sleep(3)
 
         except KeyboardInterrupt:
             send_telegram("🛑 <b>Robot arrete.</b>")
-            log.info("Arret")
             break
         except Exception as e:
             log.error("Erreur : {}".format(e))
